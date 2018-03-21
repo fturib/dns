@@ -10,10 +10,12 @@ import (
 	"net"
 	"sync"
 	"time"
+	"log"
+	"fmt"
 )
 
 // Maximum number of TCP queries before we close the socket.
-const maxTCPQueries = 128
+const maxTCPQueries = 5
 
 // Handler is implemented by any value that implements ServeDNS.
 type Handler interface {
@@ -93,6 +95,55 @@ func HandleFailed(w ResponseWriter, r *Msg) {
 }
 
 func failedHandler() Handler { return HandlerFunc(HandleFailed) }
+
+var TCPDebug = true
+
+func DebugLogDNSMessage(header string, msg *Msg) {
+	if TCPDebug {
+		log.Printf("**[ %d ]******** % s********\n%s\n", int(msg.Id), header, msg.String())
+	}
+}
+
+func DebugLogDNS(header string, msg *Msg) {
+	if TCPDebug {
+		if msg != nil {
+			log.Printf("**[ %d ]*** -  % s\n", int(msg.Id), header)
+			return
+		}
+		log.Printf("**[ ---- ]*** -  % s\n", header)
+	}
+	return
+}
+
+// Recorder is a type of ResponseWriter that captures
+// the rcode code written to it and also the size of the message
+// written in the response. A rcode code does not have
+// to be written, however, in which case 0 must be assumed.
+// It is best to have the constructor initialize this type
+// with that default status code.
+type LogResponseWriter struct {
+	ResponseWriter
+}
+
+// NewRecorder makes and returns a new Recorder,
+// which captures the DNS rcode from the ResponseWriter
+// and also the length of the response message written through it.
+func NewLogResponseWriter(w ResponseWriter) *LogResponseWriter {
+	return &LogResponseWriter{
+		ResponseWriter: w,
+	}
+}
+
+func (r *LogResponseWriter) LogMsgQuery(res *Msg) {
+	DebugLogDNSMessage("DNS QUERY", res)
+}
+
+// WriteMsg records the status code and calls the
+// underlying ResponseWriter's WriteMsg method.
+func (r *LogResponseWriter) WriteMsg(res *Msg) error {
+	DebugLogDNSMessage("DNS RESPONSE", res)
+	return r.ResponseWriter.WriteMsg(res)
+}
 
 // ListenAndServe Starts a server on address and network specified Invoke handler
 // for incoming queries.
@@ -539,6 +590,8 @@ func (srv *Server) serve(a net.Addr, h Handler, m []byte, u *net.UDPConn, s *Ses
 	if srv.DecorateReader != nil {
 		reader = srv.DecorateReader(reader)
 	}
+	ww := NewLogResponseWriter(w)
+
 Redo:
 	req := new(Msg)
 	err := req.Unpack(m)
@@ -546,9 +599,14 @@ Redo:
 		x := new(Msg)
 		x.SetRcodeFormatError(req)
 		w.WriteMsg(x)
+		DebugLogDNS("EXIT - Request is invalid", nil)
 		goto Exit
 	}
+
+	ww.LogMsgQuery(req)
+
 	if !srv.Unsafe && req.Response {
+		DebugLogDNS("EXIT - Request is a response", req)
 		goto Exit
 	}
 
@@ -564,22 +622,27 @@ Redo:
 			w.tsigRequestMAC = req.Extra[len(req.Extra)-1].(*TSIG).MAC
 		}
 	}
-	h.ServeDNS(w, req) // Writes back to the client
+	DebugLogDNS(fmt.Sprintf(" SERVE - Serve the request - # is %d", q), req)
+	h.ServeDNS(ww, req) // Writes back to the client
 
 Exit:
 	if w.tcp == nil {
+		DebugLogDNS(" EXIT - Writer is not tcp ", req)
 		return
 	}
 	// TODO(miek): make this number configurable?
 	if q > maxTCPQueries { // close socket after this many queries
+		DebugLogDNS(fmt.Sprintf(" EXIT - #queries (%d) is over %d ", q, maxTCPQueries), req)
 		w.Close()
 		return
 	}
 
 	if w.hijacked {
+		DebugLogDNS(" EXIT - Hijacked by handler",req)
 		return // client calls Close()
 	}
 	if u != nil { // UDP, "close" and return
+		DebugLogDNS(" EXIT - UDP mode ?? - closing the writer and return", req)
 		w.Close()
 		return
 	}
@@ -587,11 +650,13 @@ Exit:
 	if srv.IdleTimeout != nil {
 		idleTimeout = srv.IdleTimeout()
 	}
+	DebugLogDNS(fmt.Sprintf(" WAIT - wait another query for %v", idleTimeout), req)
 	m, err = reader.ReadTCP(w.tcp, idleTimeout)
 	if err == nil {
 		q++
 		goto Redo
 	}
+	DebugLogDNS(fmt.Sprintf(" EXIT - error while waiting, %v", err), req)
 	w.Close()
 	return
 }
